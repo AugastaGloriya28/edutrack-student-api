@@ -61,6 +61,58 @@ User question: {question}
 Provide a clear, concise, human-readable answer:"""
 
 
+def _grounded_fallback(question: str, students: List[Student]) -> str:
+    """Deterministic, grounded fallback answer engine when Ollama is offline."""
+    import re
+    q = question.lower()
+    total = len(students)
+
+    # 1. Total count
+    if any(k in q for k in ["how many student", "total student", "number of student", "count student"]):
+        return f"There are currently {total} students registered in the database."
+
+    # 2. Born after / before
+    born_after_match = re.search(r"born after (\d{4})", q)
+    if born_after_match:
+        year = int(born_after_match.group(1))
+        matched = [s for s in students if s.date_of_birth.year > year]
+        if not matched:
+            return f"No students were found born after {year}."
+        names = [f"{s.name} (DOB: {s.date_of_birth}, Course: {s.course or 'N/A'})" for s in matched]
+        return f"There are {len(matched)} student(s) born after {year}:\n- " + "\n- ".join(names)
+
+    born_before_match = re.search(r"born before (\d{4})", q)
+    if born_before_match:
+        year = int(born_before_match.group(1))
+        matched = [s for s in students if s.date_of_birth.year < year]
+        if not matched:
+            return f"No students were found born before {year}."
+        names = [f"{s.name} (DOB: {s.date_of_birth}, Course: {s.course or 'N/A'})" for s in matched]
+        return f"There are {len(matched)} student(s) born before {year}:\n- " + "\n- ".join(names)
+
+    # 3. Youngest / Oldest
+    if "youngest" in q:
+        youngest = max(students, key=lambda s: s.date_of_birth)
+        return f"The youngest student is {youngest.name}, born on {youngest.date_of_birth} (Course: {youngest.course or 'N/A'})."
+
+    if "oldest" in q:
+        oldest = min(students, key=lambda s: s.date_of_birth)
+        return f"The oldest student is {oldest.name}, born on {oldest.date_of_birth} (Course: {oldest.course or 'N/A'})."
+
+    # 4. Course matching
+    courses = {s.course for s in students if s.course}
+    for c in courses:
+        if c.lower() in q:
+            matched = [s for s in students if s.course and s.course.lower() == c.lower()]
+            names = [s.name for s in matched]
+            return f"There are {len(matched)} student(s) enrolled in {c}: {', '.join(names)}."
+
+    # 5. General summary
+    summary_list = [f"{s.name} ({s.course or 'General'}, ID: {s.id})" for s in students[:5]]
+    more = f" and {total - 5} more." if total > 5 else "."
+    return f"Based on the database records ({total} total students): {', '.join(summary_list)}{more}"
+
+
 @router.post(
     "/ask",
     response_model=AIQueryResponse,
@@ -68,10 +120,11 @@ Provide a clear, concise, human-readable answer:"""
     description=(
         "Sends a natural-language question to a locally-running **Ollama** model. "
         "The model only sees data fetched by the backend — it cannot run SQL queries directly. "
-        "\n\n**Requires**: Ollama running locally (`ollama serve`) with the `llama3.2:1b` model pulled."
+        "\n\n**Requires**: Ollama running locally (`ollama serve`) with the `llama3.2:1b` model pulled. "
+        "If Ollama is not running, an intelligent grounded fallback engine responds directly."
         "\n\nExample questions:\n"
         "- *How many students are there?*\n"
-        "- *List students enrolled in Computer Science.*\n"
+        "- *List students born after 2005.*\n"
         "- *Who is the youngest student?*"
     ),
 )
@@ -90,9 +143,10 @@ async def ask_ai(payload: AIQueryRequest, db: Session = Depends(get_db)):
     context = _serialize_students(students)
     prompt = _build_prompt(payload.question, context)
 
-    # 2. Call Ollama
+    # 2. Call Ollama with grounded fallback if offline
+    model_used = OLLAMA_MODEL
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=3.0) as client:
             response = await client.post(
                 OLLAMA_URL,
                 json={
@@ -104,26 +158,15 @@ async def ask_ai(payload: AIQueryRequest, db: Session = Depends(get_db)):
             response.raise_for_status()
             data: Dict[str, Any] = response.json()
             answer = data.get("response", "").strip()
-
-    except httpx.ConnectError:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                "Cannot connect to Ollama. "
-                "Make sure Ollama is running (`ollama serve`) and the model is pulled "
-                f"(`ollama pull {OLLAMA_MODEL}`)."
-            ),
-        )
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Ollama returned an error: {e.response.text}",
-        )
+    except Exception:
+        # Fallback to local grounded answering from database records
+        answer = _grounded_fallback(payload.question, students)
+        model_used = f"{OLLAMA_MODEL} (offline fallback: grounded SQLite context)"
 
     return AIQueryResponse(
         question=payload.question,
         answer=answer,
-        model_used=OLLAMA_MODEL,
+        model_used=model_used,
         records_consulted=len(students),
     )
 
